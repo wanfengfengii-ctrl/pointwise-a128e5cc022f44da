@@ -27,6 +27,27 @@
 
 缺少有效标识所指的修订抛 `KeyError`。非法参数、非法样点下标、无效包或修订不符抛 `ValueError`。V1 接口、原测试及历史成果继续按 README.md 使用。
 
+## `plan` 格式与包校验口径
+
+`plan` 为 JSON 对象，含两个字段：
+
+| 字段 | 结构 | 含义 |
+| --- | --- | --- |
+| `stages` | 级数长度的数组；每项为 tap 数组，每个 tap 为 `[偏移, 分子, 正分母]`，按偏移升序、权重非零 | 冻结的 2～6 级有序滤波，离线方可据此独立重算 |
+| `terms` | 与窗口等长的数组（第 `k` 项对应输出 `lo+k`）；每项为净系数数组，元素为 `[原下标, 分子, 正分母]`，按原下标升序、净系数非零 | 该输出按原始下标识并后的有效来源，抵消为零的下标不出现 |
+
+整包使用 `sort_keys=True`、紧凑分隔符序列化为 UTF-8 JSON 字节。样点文件继续沿用 `sample_transfer` 的 V1 稀疏编解码，包自身不携带任何读值，接收方无需站内库或配方库。
+
+`decode_cascade_package` 与 `run_exchange` 对字节包采用同一校验口径，任一项不符即抛 `ValueError`：
+
+1. JSON 可解析，根对象字段恰为 `version`、`revision`、`length`、`window`、`required_samples`、`plan`；`version` 必须为整数 `2`，V1 包按不支持版本拒绝。
+2. `revision` 为非空字符串；`length` 为正整数；`window` 为两个整数且满足 `0 <= lo <= hi <= length`；`required_samples` 为整数数组。
+3. `plan` 字段恰为 `stages` 与 `terms`；每级 tap、每条净系数均为三元整数数组，分母为正且可构造精确 `Fraction`；布尔值不能充当下标、偏移或分子分母。
+4. 由冻结的 `stages` 从恒等层开始按“输出 `i` 读上一级 `i+偏移`、越界读零、按原下标精确合并有符号系数、净零剔除”在整个 `[0,N)` 上重算；窗口切片必须与 `terms` 逐项相等，其升序去重并集必须与 `required_samples` 相等，窗口长度必须与 `terms` 行数相等。
+5. `run_exchange` 另核对调用 `revision`、样点表 `revision` 与包内 `revision` 三者一致；样点下标必须落在 `[0,N)`，同修订的记录内额外样点允许带入。
+
+`prepare_exchange` 只读取 `RevisionStore` 并返回字节，不写交接库也不写账册；`run_exchange` 为纯内存复算。包与修订标识固定绑定，后续补录产生新修订不会改变既有包，旧包配合同修订样点复算结果保持不变。
+
 ## 可核对的交班样例
 
 使用 `examples/acquisition.json` 的原记录 `(2, 缺测, 7)`。两级输入为 `({0: 1, 1: 1}, {-1: -1, 0: 1})`。

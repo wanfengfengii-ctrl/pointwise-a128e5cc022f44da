@@ -5,12 +5,12 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 
 from exchange.issue_store import WindowIssueStore, export_window
-from exchange.prepare import prepare_window
+from exchange.prepare import prepare_exchange, prepare_window
 from ledger.admission import publish_result
 from ledger.export import export_result
 from ledger.report_reader import read_result
 from ledger.report_store import ResultStore
-from processing.replay import run_window
+from processing.replay import run_exchange, run_window
 from processing.result_rows import MissingRow, ValueRow
 from recipe.catalog import register_recipe
 from recipe.revision_store import RecipeStore
@@ -44,6 +44,78 @@ def review_and_archive(ledger_path, result_id, transfer):
         ledger.initialize()
         archived = publish_result(ledger, result_id, payload, result)
     return archived
+
+
+def cascade_handover(directory, station_path, examples):
+    """Demonstrate the V2 multi-stage exchange: collect on the manifest, then run offline."""
+    stages = ({0: 1, 1: 1}, {-1: -1, 0: 1})
+    with closing(RevisionStore(station_path)) as revisions:
+        revisions.initialize()
+        original = import_wave_file(revisions, examples / 'acquisition.json')
+
+        def handoff(label, lo, hi):
+            payload = prepare_exchange(revisions, original, stages, lo, hi)
+            document = json.loads(payload)
+            samples = read_samples(revisions, original, document['required_samples'])
+            package_path = directory / f'{label}.exchange.json'
+            samples_path = directory / f'{label}.exchange-samples.json'
+            package_path.write_bytes(payload)
+            samples_path.write_bytes(encode_sample_transfer(samples))
+            return package_path, samples_path, document
+
+        transfers = [
+            handoff('head-cancel', 1, 2),
+            handoff('head-truncated-gap', 0, 3),
+            handoff('empty-window', 1, 1),
+        ]
+        # The correction below publishes a new revision while the original binding stays fixed.
+        base = revisions.get_revision(original)
+        corrected = import_revision(revisions, base.source, base.length, base.unit, {1: 3}, original)
+        complete_path = directory / 'complete.exchange.json'
+        complete_payload = prepare_exchange(revisions, corrected, stages, 0, 3)
+        complete_path.write_bytes(complete_payload)
+        complete_samples = read_samples(revisions, corrected, [0, 1, 2])
+        complete_sample_path = directory / 'complete.exchange-samples.json'
+        complete_sample_path.write_bytes(encode_sample_transfer(complete_samples))
+
+    # The station library is closed here. Only the self-contained package bytes and the
+    # same-revision sparse sample files are used from now on; no store is ever reopened.
+    for label, (package_path, samples_path, document) in zip(
+            ('head-cancel', 'head-truncated-gap', 'empty-window'), transfers):
+        rows = run_exchange(package_path.read_bytes(), original,
+                            decode_sample_transfer(samples_path.read_bytes()))
+        check(document['version'] == 2, 'exchange package must be version 2')
+        serialized = [
+            {'index': row.index, 'value': str(row.value)} if isinstance(row, ValueRow)
+            else {'index': row.index, 'missing': list(row.missing)} for row in rows
+        ]
+        print(json.dumps({'case': label, 'revision': document['revision'],
+                          'window': document['window'], 'required_samples': document['required_samples'],
+                          'rows': serialized}, ensure_ascii=False, sort_keys=True))
+
+    # Cross-stage cancellation: interior output 1 collapses to -x_0 + x_2, so original
+    # index 1 never enters the manifest even though both stages read intermediate index 1.
+    package_path, samples_path, document = transfers[0]
+    check(document['required_samples'] == [0, 2], 'canceled index must leave the collection manifest')
+    check(run_exchange(package_path.read_bytes(), original,
+                       decode_sample_transfer(samples_path.read_bytes())) == (ValueRow(1, Fraction(5)),),
+          'cross-stage cancellation result mismatch')
+
+    # Head truncation followed by a gap: the full window keeps the boundary zeros and
+    # reports the unrecorded original 1 for both affected outputs.
+    package_path, _, document = transfers[1]
+    check(document['required_samples'] == [0, 1, 2], 'gap must stay on the collection manifest')
+    partial = decode_sample_transfer((directory / 'head-truncated-gap.exchange-samples.json').read_bytes())
+    check(run_exchange(package_path.read_bytes(), original, partial)
+          == (MissingRow(0, (1,)), ValueRow(1, Fraction(5)), MissingRow(2, (1,))),
+          'head-truncated gap processing mismatch')
+
+    # The new revision replays to its own values; the original package above is unchanged.
+    complete_rows = run_exchange(complete_path.read_bytes(), corrected,
+                                 decode_sample_transfer(complete_sample_path.read_bytes()))
+    check(complete_rows == tuple(ValueRow(i, Fraction(value)) for i, value in enumerate((5, 5, -3))),
+          'corrected multi-stage replay mismatch')
+    return original, corrected
 
 
 def main():
@@ -87,6 +159,9 @@ def main():
                 summary = {'result_id': document['result_id'], 'unit': document['package']['output_unit'],
                            'required_samples': document['package']['required_samples'], 'rows': document['rows']}
                 print(json.dumps(summary, ensure_ascii=False, sort_keys=True))
+        # Multi-stage exchange: collection while connected, then fully offline replay
+        # with neither the station library nor the ledger available.
+        cascade_handover(directory, station_path, examples)
     return 0
 
 
